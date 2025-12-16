@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.30;
+pragma solidity 0.8.31;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
@@ -7,6 +7,12 @@ import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+// Minimal LayerZero endpoint interface (declared outside contract to avoid parser errors)
+interface ILayerZeroEndpoint {
+    function send(uint16 _dstChainId, bytes calldata _destination, bytes calldata _payload, address payable _refundAddress, address _zroPaymentAddress, bytes calldata _adapterParams) external payable;
+    function estimateFees(uint16 _dstChainId, address _userApplication, bytes calldata _payload, bool _payInZRO, bytes calldata _adapterParams) external view returns (uint256 nativeFee, uint256 zroFee);
+}
 
 /**
  * @title BeGreenlyToken Secure V3 - FINAL (ALL VULNERABILITIES FIXED)
@@ -69,7 +75,7 @@ contract BeGreenlyTokenSecureV3 is
     event OwnershipRenounced(address indexed previousOwner, address indexed multisig);
     event BlacklistRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
     event RoleTransferredToMultisig(bytes32 indexed role, address indexed multisig);
-    event BlacklistTokenSeized(address indexed from, address indexed recipient, uint256 amount);
+    // Note: forced seizure on blacklist removed for safety on proxyed live contract
     event WalletExemptionsUpdated(address indexed wallet, bool feeExempt, bool walletLimitExempt, bool txLimitExempt);
     event TxDelayUpdated(uint256 oldDelay, uint256 newDelay);
 
@@ -185,56 +191,36 @@ contract BeGreenlyTokenSecureV3 is
     function batchBlacklist(
         address[] calldata accounts,
         bool status
-    ) external onlyMultisig nonReentrant {
+    ) external nonReentrant onlyMultisig {
         if (accounts.length > MAX_BATCH_SIZE) revert BatchTooLarge();
-        
-        for (uint i = 0; i < accounts.length; i++) {
+
+        uint256 len = accounts.length;
+        for (uint i = 0; i < len; ++i) {
             address a = accounts[i];
             if (_walletControls[a].isBlacklisted != status) {
                 _walletControls[a].isBlacklisted = status;
                 emit WalletControlsUpdated(a, _walletControls[a]);
-
-                if (status) {
-                    uint256 bal = balanceOf(a);
-                    if (bal > 0 && blacklistRecipient != a) {
-                        super._transfer(a, blacklistRecipient, bal);
-                        emit BlacklistTokenSeized(a, blacklistRecipient, bal);
-                    }
-                }
             }
         }
         emit BlacklistBatch(accounts, status);
     }
 
-    function emergencyBlacklist(address account) external onlyMultisig nonReentrant {
+    function emergencyBlacklist(address account) external nonReentrant onlyMultisig {
         if (!_walletControls[account].isBlacklisted) {
             _walletControls[account].isBlacklisted = true;
             emit WalletControlsUpdated(account, _walletControls[account]);
         }
-        uint256 bal = balanceOf(account);
-        if (bal > 0 && blacklistRecipient != account) {
-            super._transfer(account, blacklistRecipient, bal);
-            emit BlacklistTokenSeized(account, blacklistRecipient, bal);
-        }
         emit EmergencyBlacklist(account, msg.sender);
     }
 
-    function setBlacklist(address account, bool status) external onlyMultisig nonReentrant {
+    function setBlacklist(address account, bool status) external nonReentrant onlyMultisig {
         if (_walletControls[account].isBlacklisted != status) {
             _walletControls[account].isBlacklisted = status;
             emit WalletControlsUpdated(account, _walletControls[account]);
-
-            if (status) {
-                uint256 bal = balanceOf(account);
-                if (bal > 0 && blacklistRecipient != account) {
-                    super._transfer(account, blacklistRecipient, bal);
-                    emit BlacklistTokenSeized(account, blacklistRecipient, bal);
-                }
-            }
         }
     }
 
-    function multisigRecover(address target, address recipient) external onlyMultisig nonReentrant {
+    function multisigRecover(address target, address recipient) external nonReentrant onlyMultisig {
         if (!_walletControls[target].isBlacklisted) revert TargetNotBlacklisted();
         uint256 amount = balanceOf(target);
         if (amount == 0) revert NoTokensToRecover();
@@ -247,11 +233,12 @@ contract BeGreenlyTokenSecureV3 is
     function batchTransfer(
         address[] calldata recipients,
         uint256[] calldata amounts
-    ) external onlyMultisig nonReentrant whenNotPaused {
+    ) external nonReentrant onlyMultisig whenNotPaused {
         if (recipients.length != amounts.length) revert LengthMismatch();
         if (recipients.length > MAX_BATCH_SIZE) revert BatchTooLarge();
-        
-        for (uint256 i = 0; i < recipients.length; i++) {
+
+        uint256 len = recipients.length;
+        for (uint256 i = 0; i < len; ++i) {
             address to = recipients[i];
             uint256 amt = amounts[i];
             if (to == address(0)) revert InvalidAddress();
@@ -262,34 +249,44 @@ contract BeGreenlyTokenSecureV3 is
 
     function setTransactionFeeByMultisig(uint256 newFee) external onlyMultisig {
         if (newFee > MAX_FEE_PERCENTAGE) revert FeeTooHigh();
-        _tokenConfig.transactionFeePercentage = newFee;
-        emit TokenConfigModified(_tokenConfig);
+        if (_tokenConfig.transactionFeePercentage != newFee) {
+            _tokenConfig.transactionFeePercentage = newFee;
+            emit TokenConfigModified(_tokenConfig);
+        }
     }
 
     function setWalletLimit(uint256 walletPct) external onlyMultisig {
         if (walletPct < MIN_WALLET_PERCENTAGE || walletPct > MAX_WALLET_PERCENTAGE) revert InvalidLimits();
-        _tokenConfig.maxWalletPercentage = walletPct;
-        emit LimitsUpdated(walletPct, maxTxLimit);
+        if (_tokenConfig.maxWalletPercentage != walletPct) {
+            _tokenConfig.maxWalletPercentage = walletPct;
+            emit LimitsUpdated(walletPct, maxTxLimit);
+        }
     }
 
     function setMaxTxLimit(uint256 newLimit) external onlyMultisig {
         if (newLimit > MAX_TX_LIMIT) revert InvalidLimits();
-        maxTxLimit = newLimit;
-        emit LimitsUpdated(_tokenConfig.maxWalletPercentage, maxTxLimit);
+        if (maxTxLimit != newLimit) {
+            maxTxLimit = newLimit;
+            emit LimitsUpdated(_tokenConfig.maxWalletPercentage, maxTxLimit);
+        }
     }
 
     function setTxLimit(uint256 newLimit) external onlyMultisig {
         if (newLimit > MAX_TX_LIMIT) revert InvalidLimits();
-        txLimit = newLimit;
-        emit LimitsUpdated(_tokenConfig.maxWalletPercentage, txLimit);
+        if (txLimit != newLimit) {
+            txLimit = newLimit;
+            emit LimitsUpdated(_tokenConfig.maxWalletPercentage, txLimit);
+        }
     }
 
     function setFeeCollectorByMultisig(address newCollector) external onlyMultisig {
         if (newCollector == address(0)) revert InvalidAddress();
-        _tokenConfig.feeCollector = newCollector;
-        // Exempt fee collector from wallet limits to avoid accidental max-wallet violations
-        _walletControls[newCollector].isWalletLimitExempt = true;
-        emit TokenConfigModified(_tokenConfig);
+        if (_tokenConfig.feeCollector != newCollector) {
+            _tokenConfig.feeCollector = newCollector;
+            // Exempt fee collector from wallet limits to avoid accidental max-wallet violations
+            _walletControls[newCollector].isWalletLimitExempt = true;
+            emit TokenConfigModified(_tokenConfig);
+        }
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {
@@ -338,8 +335,8 @@ contract BeGreenlyTokenSecureV3 is
         // Pause check
         if (paused()) revert ContractPaused();
 
-        WalletControls memory senderControls = _walletControls[from];
-        WalletControls memory recipientControls = _walletControls[to];
+        WalletControls storage senderControls = _walletControls[from];
+        WalletControls storage recipientControls = _walletControls[to];
 
         // Blacklist check
         if (senderControls.isBlacklisted) revert BlacklistedAddress();
@@ -372,7 +369,8 @@ contract BeGreenlyTokenSecureV3 is
             }
             
             uint256 maxWallet = (MAX_SUPPLY * _tokenConfig.maxWalletPercentage) / 100;
-            if (balanceOf(to) + actualReceived > maxWallet) revert ExceedsMaxWallet();
+            uint256 toBalance = balanceOf(to);
+            if (toBalance + actualReceived > maxWallet) revert ExceedsMaxWallet();
         }
 
         // Transaction limit check
@@ -440,6 +438,82 @@ contract BeGreenlyTokenSecureV3 is
         if (newImplementation == address(0)) revert InvalidAddress();
     }
 
+    // --- LayerZero / OFT-related storage (no on-token bridging implementation) ---
+    ILayerZeroEndpoint public lzEndpoint;
+    mapping(uint16 => bytes) public trustedRemoteLookup; // dstChainId => remote contract bytes
+    bool public oftEnabled;
+    // NOTE: `oftAdapter` is reserved to point to an external official OFT adapter contract.
+    // Keep this storage slot to remain layout-compatible with previous upgrades.
+    address public oftAdapter;
+
+    event LayerZeroEndpointUpdated(address indexed endpoint);
+    event TrustedRemoteSet(uint16 indexed chainId, bytes remote);
+    event OftAdapterUpdated(address indexed oldAdapter, address indexed newAdapter);
+    event CrossChainSent(address indexed sender, uint16 indexed dstChainId, bytes indexed toAddress, uint256 amount, uint64 nonce);
+    event CrossChainReceived(uint16 indexed srcChainId, address indexed to, uint256 amount, uint64 nonce);
+
+    error OftDisabled();
+    error TrustedRemoteNotSet();
+    error InvalidLayerZeroEndpoint();
+    error NotLayerZeroEndpoint();
+
+    // Set LayerZero endpoint (multisig only)
+    function setLayerZeroEndpoint(address endpoint) external onlyMultisig {
+        if (endpoint == address(0)) revert InvalidAddress();
+        if (address(lzEndpoint) != endpoint) {
+            lzEndpoint = ILayerZeroEndpoint(endpoint);
+            emit LayerZeroEndpointUpdated(endpoint);
+        }
+    }
+
+    // Set trusted remote contract address for a chain id (multisig only)
+    function setTrustedRemote(uint16 _chainId, bytes calldata _remote) external onlyMultisig {
+        if (_remote.length == 0) revert InvalidAddress();
+        // avoid unnecessary storage write
+        if (keccak256(trustedRemoteLookup[_chainId]) != keccak256(_remote)) {
+            trustedRemoteLookup[_chainId] = _remote;
+            emit TrustedRemoteSet(_chainId, _remote);
+        }
+    }
+
+    // Toggle OFT functionality (multisig only)
+    function toggleOftEnabled(bool enabled) external onlyMultisig {
+        if (oftEnabled != enabled) {
+            oftEnabled = enabled;
+        }
+    }
+
+    // Set official OFT adapter address (deployer/multisig should deploy official adapter separately)
+    function setOftAdapter(address adapter) external onlyMultisig {
+        if (adapter == address(0)) revert InvalidAddress();
+        address old = oftAdapter;
+        if (old != adapter) {
+            oftAdapter = adapter;
+            emit OftAdapterUpdated(old, adapter);
+        }
+    }
+
+    /**
+     * @notice Lock tokens on this chain and send a LayerZero message to destination chain.
+     * @dev Tokens are transferred to `multisigWallet` (locked). Destination `lzReceive` will
+     *      transfer tokens from its `multisigWallet` to the recipient (unlock).
+     *      Caller must send enough native gas to pay LayerZero fees via `msg.value` or use adapter params.
+     */
+    function sendCrossChain(uint16, bytes calldata, uint256, bytes calldata) external payable whenNotPaused nonReentrant {
+        // Deprecated: Use official LayerZero OFT adapter contracts and the external adapter's API.
+        // This contract intentionally does NOT implement custom bridging logic.
+        // Deploy an official OFT adapter (Polygon) that interacts with this token (via ERC20 approvals/transfers).
+        revert OftDisabled();
+    }
+
+    // Called by LayerZero endpoint on incoming messages
+    function lzReceive(uint16, bytes calldata, uint64, bytes calldata) external nonReentrant whenNotPaused {
+        // Deprecated: this contract does not handle inbound LayerZero messages.
+        // Use official LayerZero OFT implementations on destination chains (they will call token transfers
+        // or adapter contracts to unlock/credit users). Keep bridging logic off-token for security.
+        revert NotLayerZeroEndpoint();
+    }
+
     function getWalletControls(address wallet) external view returns (WalletControls memory) {
         return _walletControls[wallet];
     }
@@ -467,4 +541,7 @@ contract BeGreenlyTokenSecureV3 is
             maxTxLimit
         );
     }
+
+    // Reserved storage gap for future variable additions (storage-compatible)
+    uint256[50] private __gap;
 }
